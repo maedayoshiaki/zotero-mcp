@@ -11,12 +11,47 @@
  *   POST /mcp/search            - Search for items
  *   POST /mcp/children          - Get child items
  *   POST /mcp/annotations/delete - Trash or permanently delete annotation(s)
+ *   POST /mcp/annotations/update - Update an existing annotation
+ *   POST /mcp/notes             - Create a note item (child or standalone)
+ *   POST /mcp/items/update      - Update item fields / creators / note content
+ *   POST /mcp/tags              - Add / remove / replace tags on an item
+ *   POST /mcp/collections       - Add / remove an item to / from collections
+ *   POST /mcp/collections/create - Create a new collection
+ *   POST /mcp/attachments       - Add an attachment (file import/link or URL)
  */
 
 var MCP_Zotero;
 
 function log(msg) {
     Zotero.debug("[MCP-Zotero] " + msg);
+}
+
+// Parse a request body that Zotero may hand us as an object or a (possibly
+// URL-encoded) JSON string. Throws on invalid JSON.
+function parseBody(requestData) {
+    if (typeof requestData === 'object' && requestData !== null) {
+        return requestData;
+    }
+    if (typeof requestData === 'string' && requestData.length) {
+        let s = requestData;
+        if (s.startsWith('%')) {
+            s = decodeURIComponent(s);
+        }
+        return JSON.parse(s);
+    }
+    return {};
+}
+
+// Resolve a collection in the user library by 8-char key or by name.
+function resolveCollection(spec) {
+    let libraryID = Zotero.Libraries.userLibraryID;
+    let all = Zotero.Collections.getByLibrary(libraryID, true);
+    for (let c of all) {
+        if (c.key === spec || c.name === spec) {
+            return c;
+        }
+    }
+    return null;
 }
 
 function install(data, reason) {
@@ -776,6 +811,327 @@ function registerEndpoints() {
                     error: "Internal error",
                     message: e.message
                 }));
+            }
+        }
+    });
+
+    // Update an existing annotation (comment, color, text, pageLabel, position, tags)
+    registerEndpoint("/mcp/annotations/update", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function(requestData, sendResponseCallback) {
+            try {
+                let data;
+                try { data = parseBody(requestData); }
+                catch (e) { return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Invalid JSON", message: e.message })); }
+
+                if (!data.key) {
+                    return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: key" }));
+                }
+                let item = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, data.key);
+                if (!item) return sendResponseCallback(404, "application/json", JSON.stringify({ error: "Annotation not found", key: data.key }));
+                if (!item.isAnnotation()) return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Item is not an annotation", key: data.key }));
+
+                if (data.comment !== undefined) item.annotationComment = data.comment;
+                if (data.color !== undefined) item.annotationColor = data.color;
+                if (data.text !== undefined) item.annotationText = data.text;
+                if (data.pageLabel !== undefined) item.annotationPageLabel = String(data.pageLabel);
+                if (data.sortIndex !== undefined) item.annotationSortIndex = data.sortIndex;
+                if (data.position !== undefined) {
+                    item.annotationPosition = (typeof data.position === 'object') ? JSON.stringify(data.position) : data.position;
+                }
+                if (Array.isArray(data.tags)) {
+                    item.setTags(data.tags.map(function(t) { return (typeof t === 'string') ? { tag: t } : t; }));
+                }
+
+                await item.saveTx();
+                log("Updated annotation: " + item.key);
+                sendResponseCallback(200, "application/json", JSON.stringify({
+                    success: true,
+                    annotation: { key: item.key, type: item.annotationType, color: item.annotationColor, comment: item.annotationComment, pageLabel: item.annotationPageLabel }
+                }));
+            } catch (e) {
+                log("Error updating annotation: " + e);
+                sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
+            }
+        }
+    });
+
+    // Create a note item (child of an item, or standalone), with optional tags/collections
+    registerEndpoint("/mcp/notes", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function(requestData, sendResponseCallback) {
+            try {
+                let data;
+                try { data = parseBody(requestData); }
+                catch (e) { return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Invalid JSON", message: e.message })); }
+
+                if (!data.note) {
+                    return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: note" }));
+                }
+
+                let libraryID = Zotero.Libraries.userLibraryID;
+                let note = new Zotero.Item('note');
+                note.libraryID = libraryID;
+
+                if (data.parentItemKey) {
+                    let parent = await Zotero.Items.getByLibraryAndKeyAsync(libraryID, data.parentItemKey);
+                    if (!parent) {
+                        return sendResponseCallback(404, "application/json", JSON.stringify({ error: "Parent item not found", key: data.parentItemKey }));
+                    }
+                    note.parentID = parent.id;
+                }
+
+                note.setNote(String(data.note));
+
+                if (Array.isArray(data.tags)) {
+                    for (let t of data.tags) { note.addTag(typeof t === 'string' ? t : t.tag); }
+                }
+
+                await note.saveTx();
+
+                // Collections only apply to a top-level (standalone) note
+                if (!data.parentItemKey && Array.isArray(data.collections) && data.collections.length) {
+                    for (let spec of data.collections) {
+                        let col = resolveCollection(spec);
+                        if (col) note.addToCollection(col.id);
+                    }
+                    await note.saveTx();
+                }
+
+                log("Created note: " + note.key);
+                sendResponseCallback(201, "application/json", JSON.stringify({
+                    success: true,
+                    note: { id: note.id, key: note.key, parentItemKey: data.parentItemKey || null }
+                }));
+            } catch (e) {
+                log("Error creating note: " + e);
+                sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
+            }
+        }
+    });
+
+    // Update item fields / creators, and note content for note items
+    registerEndpoint("/mcp/items/update", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function(requestData, sendResponseCallback) {
+            try {
+                let data;
+                try { data = parseBody(requestData); }
+                catch (e) { return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Invalid JSON", message: e.message })); }
+
+                if (!data.key) {
+                    return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: key" }));
+                }
+                let item = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, data.key);
+                if (!item) return sendResponseCallback(404, "application/json", JSON.stringify({ error: "Item not found", key: data.key }));
+
+                let applied = [];
+                let skipped = [];
+
+                if (data.note !== undefined && item.isNote()) {
+                    item.setNote(String(data.note));
+                    applied.push("note");
+                }
+
+                if (data.fields && typeof data.fields === 'object') {
+                    for (let name in data.fields) {
+                        try {
+                            let fieldID = Zotero.ItemFields.getID(name);
+                            if (fieldID && Zotero.ItemFields.isValidForType(fieldID, item.itemTypeID)) {
+                                item.setField(name, data.fields[name]);
+                                applied.push(name);
+                            } else {
+                                skipped.push(name);
+                            }
+                        } catch (fe) {
+                            skipped.push(name);
+                        }
+                    }
+                }
+
+                if (Array.isArray(data.creators)) {
+                    item.setCreators(data.creators);
+                    applied.push("creators");
+                }
+
+                await item.saveTx();
+                log("Updated item " + item.key + " (" + applied.join(", ") + ")");
+                sendResponseCallback(200, "application/json", JSON.stringify({
+                    success: true, key: item.key, applied: applied, skipped: skipped
+                }));
+            } catch (e) {
+                log("Error updating item: " + e);
+                sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
+            }
+        }
+    });
+
+    // Add / remove / replace tags on an item
+    registerEndpoint("/mcp/tags", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function(requestData, sendResponseCallback) {
+            try {
+                let data;
+                try { data = parseBody(requestData); }
+                catch (e) { return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Invalid JSON", message: e.message })); }
+
+                if (!data.key) {
+                    return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: key" }));
+                }
+                let item = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, data.key);
+                if (!item) return sendResponseCallback(404, "application/json", JSON.stringify({ error: "Item not found", key: data.key }));
+
+                let norm = function(t) { return (typeof t === 'string') ? t : t.tag; };
+
+                if (Array.isArray(data.replace)) {
+                    item.setTags(data.replace.map(function(t) { return { tag: norm(t) }; }));
+                }
+                if (Array.isArray(data.add)) {
+                    for (let t of data.add) item.addTag(norm(t));
+                }
+                if (Array.isArray(data.remove)) {
+                    for (let t of data.remove) item.removeTag(norm(t));
+                }
+
+                await item.saveTx();
+                log("Updated tags on " + item.key);
+                sendResponseCallback(200, "application/json", JSON.stringify({
+                    success: true, key: item.key, tags: item.getTags().map(function(t) { return t.tag; })
+                }));
+            } catch (e) {
+                log("Error updating tags: " + e);
+                sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
+            }
+        }
+    });
+
+    // Add / remove an item to / from collections (by key or name)
+    registerEndpoint("/mcp/collections", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function(requestData, sendResponseCallback) {
+            try {
+                let data;
+                try { data = parseBody(requestData); }
+                catch (e) { return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Invalid JSON", message: e.message })); }
+
+                if (!data.key) {
+                    return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: key" }));
+                }
+                let item = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, data.key);
+                if (!item) return sendResponseCallback(404, "application/json", JSON.stringify({ error: "Item not found", key: data.key }));
+
+                let added = [], removed = [], notFound = [];
+
+                if (Array.isArray(data.add)) {
+                    for (let spec of data.add) {
+                        let col = resolveCollection(spec);
+                        if (col) { item.addToCollection(col.id); added.push(col.key); }
+                        else notFound.push(spec);
+                    }
+                }
+                if (Array.isArray(data.remove)) {
+                    for (let spec of data.remove) {
+                        let col = resolveCollection(spec);
+                        if (col) { item.removeFromCollection(col.id); removed.push(col.key); }
+                        else notFound.push(spec);
+                    }
+                }
+
+                await item.saveTx();
+                log("Updated collections on " + item.key);
+                sendResponseCallback(200, "application/json", JSON.stringify({
+                    success: true, key: item.key, added: added, removed: removed, notFound: notFound
+                }));
+            } catch (e) {
+                log("Error updating collections: " + e);
+                sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
+            }
+        }
+    });
+
+    // Create a new collection (optionally nested under a parent key/name)
+    registerEndpoint("/mcp/collections/create", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function(requestData, sendResponseCallback) {
+            try {
+                let data;
+                try { data = parseBody(requestData); }
+                catch (e) { return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Invalid JSON", message: e.message })); }
+
+                if (!data.name) {
+                    return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: name" }));
+                }
+                let col = new Zotero.Collection();
+                col.libraryID = Zotero.Libraries.userLibraryID;
+                col.name = String(data.name);
+                if (data.parent) {
+                    let parent = resolveCollection(data.parent);
+                    if (parent) col.parentID = parent.id;
+                }
+                await col.saveTx();
+                log("Created collection: " + col.key + " (" + col.name + ")");
+                sendResponseCallback(201, "application/json", JSON.stringify({
+                    success: true, collection: { key: col.key, name: col.name }
+                }));
+            } catch (e) {
+                log("Error creating collection: " + e);
+                sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
+            }
+        }
+    });
+
+    // Add an attachment: import a file, link a file, or link/import a URL
+    registerEndpoint("/mcp/attachments", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function(requestData, sendResponseCallback) {
+            try {
+                let data;
+                try { data = parseBody(requestData); }
+                catch (e) { return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Invalid JSON", message: e.message })); }
+
+                let libraryID = Zotero.Libraries.userLibraryID;
+                let parentItemID = null;
+                if (data.parentItemKey) {
+                    let parent = await Zotero.Items.getByLibraryAndKeyAsync(libraryID, data.parentItemKey);
+                    if (!parent) return sendResponseCallback(404, "application/json", JSON.stringify({ error: "Parent item not found", key: data.parentItemKey }));
+                    parentItemID = parent.id;
+                }
+
+                let att = null;
+                let mode = data.linkMode || (data.url ? "linked_url" : "imported_file");
+
+                if (data.url) {
+                    if (mode === "imported_url") {
+                        att = await Zotero.Attachments.importFromURL({ url: data.url, parentItemID: parentItemID, libraryID: libraryID, title: data.title });
+                    } else {
+                        att = await Zotero.Attachments.linkFromURL({ url: data.url, parentItemID: parentItemID, title: data.title, contentType: data.contentType });
+                    }
+                } else if (data.path) {
+                    let file = Zotero.File.pathToFile(data.path);
+                    if (mode === "linked_file") {
+                        att = await Zotero.Attachments.linkFromFile({ file: file, parentItemID: parentItemID, title: data.title });
+                    } else {
+                        att = await Zotero.Attachments.importFromFile({ file: file, parentItemID: parentItemID, libraryID: libraryID, title: data.title, contentType: data.contentType });
+                    }
+                } else {
+                    return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Provide either 'path' (a local file) or 'url'" }));
+                }
+
+                log("Created attachment: " + att.key + " mode=" + mode);
+                sendResponseCallback(201, "application/json", JSON.stringify({
+                    success: true,
+                    attachment: { id: att.id, key: att.key, title: att.getField('title'), contentType: att.attachmentContentType, mode: mode }
+                }));
+            } catch (e) {
+                log("Error creating attachment: " + e);
+                sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
             }
         }
     });

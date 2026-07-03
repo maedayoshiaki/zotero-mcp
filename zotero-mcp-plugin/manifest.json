@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "MCP Zotero API",
-  "version": "1.1.0",
-  "description": "Exposes HTTP endpoints for MCP tools to create and delete annotations and modify Zotero items",
+  "version": "1.2.0",
+  "description": "Local HTTP endpoints for Zotero: create/update/delete annotations, notes, tags, collections, attachments, and item fields",
   "author": "MCP Zotero",
   "applications": {
     "zotero": {
