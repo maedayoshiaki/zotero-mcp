@@ -10,6 +10,7 @@
  *   POST /mcp/items             - Get item details by key
  *   POST /mcp/search            - Search for items
  *   POST /mcp/children          - Get child items
+ *   POST /mcp/annotations/delete - Trash or permanently delete annotation(s)
  */
 
 var MCP_Zotero;
@@ -687,6 +688,98 @@ function registerEndpoints() {
         }
     });
     
+    // Delete or trash annotation(s) by key
+    registerEndpoint("/mcp/annotations/delete", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function(requestData, sendResponseCallback) {
+            try {
+                let data;
+                // Zotero already parses JSON for us
+                if (typeof requestData === 'object' && requestData !== null) {
+                    data = requestData;
+                } else if (typeof requestData === 'string') {
+                    try {
+                        if (requestData.startsWith('%')) {
+                            requestData = decodeURIComponent(requestData);
+                        }
+                        data = JSON.parse(requestData);
+                    } catch (e) {
+                        sendResponseCallback(400, "application/json", JSON.stringify({
+                            error: "Invalid JSON",
+                            message: e.message
+                        }));
+                        return;
+                    }
+                } else {
+                    data = {};
+                }
+
+                // Accept a single key or an array of keys
+                let keys = [];
+                if (Array.isArray(data.keys)) {
+                    keys = data.keys;
+                } else if (data.key) {
+                    keys = [data.key];
+                }
+
+                if (!keys.length) {
+                    sendResponseCallback(400, "application/json", JSON.stringify({
+                        error: "Missing required field: key or keys"
+                    }));
+                    return;
+                }
+
+                // permanent: true -> erase entirely; otherwise move to Trash
+                let permanent = data.permanent === true;
+
+                let deleted = [];
+                let notFound = [];
+                let skipped = [];
+
+                for (let key of keys) {
+                    let item = await Zotero.Items.getByLibraryAndKeyAsync(
+                        Zotero.Libraries.userLibraryID,
+                        key
+                    );
+                    if (!item) {
+                        notFound.push(key);
+                        continue;
+                    }
+                    // Only allow deleting annotation items via this endpoint
+                    if (!item.isAnnotation()) {
+                        skipped.push(key);
+                        continue;
+                    }
+                    if (permanent) {
+                        await item.eraseTx();
+                    } else {
+                        item.deleted = true;
+                        await item.saveTx();
+                    }
+                    deleted.push(key);
+                }
+
+                log("Deleted annotations (" + (permanent ? "erased" : "trashed") + "): " + deleted.join(", "));
+
+                sendResponseCallback(200, "application/json", JSON.stringify({
+                    success: true,
+                    mode: permanent ? "erased" : "trashed",
+                    deleted: deleted,
+                    notFound: notFound,
+                    skipped: skipped
+                }));
+
+            } catch (e) {
+                log("Error deleting annotation: " + e);
+                sendResponseCallback(500, "application/json", JSON.stringify({
+                    error: "Internal error",
+                    message: e.message
+                }));
+            }
+        }
+    });
+
     log("Registered " + Object.keys(MCP_Zotero.endpoints).length + " MCP endpoints");
 }
 
