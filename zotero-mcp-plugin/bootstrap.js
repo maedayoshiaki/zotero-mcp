@@ -18,6 +18,8 @@
  *   POST /mcp/collections       - Add / remove an item to / from collections
  *   POST /mcp/collections/create - Create a new collection
  *   POST /mcp/attachments       - Add an attachment (file import/link or URL)
+ *   POST /mcp/items/delete      - Trash or permanently delete item(s) (note/attachment/etc.)
+ *   POST /mcp/collections/delete - Delete a collection (by key or name)
  */
 
 var MCP_Zotero;
@@ -1131,6 +1133,100 @@ function registerEndpoints() {
                 }));
             } catch (e) {
                 log("Error creating attachment: " + e);
+                sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
+            }
+        }
+    });
+
+    // Delete or trash item(s) of any type (note, attachment, regular item, annotation) by key
+    registerEndpoint("/mcp/items/delete", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function(requestData, sendResponseCallback) {
+            try {
+                let data;
+                try { data = parseBody(requestData); }
+                catch (e) { return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Invalid JSON", message: e.message })); }
+
+                let keys = [];
+                if (Array.isArray(data.keys)) keys = data.keys;
+                else if (data.key) keys = [data.key];
+                if (!keys.length) {
+                    return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: key or keys" }));
+                }
+
+                let permanent = data.permanent === true;
+                let deleted = [], notFound = [];
+
+                for (let key of keys) {
+                    let item = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, key);
+                    if (!item) { notFound.push(key); continue; }
+                    if (permanent) {
+                        await item.eraseTx();
+                    } else {
+                        item.deleted = true;
+                        await item.saveTx();
+                    }
+                    deleted.push(key);
+                }
+
+                log("Deleted items (" + (permanent ? "erased" : "trashed") + "): " + deleted.join(", "));
+                sendResponseCallback(200, "application/json", JSON.stringify({
+                    success: true,
+                    mode: permanent ? "erased" : "trashed",
+                    deleted: deleted,
+                    notFound: notFound
+                }));
+            } catch (e) {
+                log("Error deleting items: " + e);
+                sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
+            }
+        }
+    });
+
+    // Delete a collection (by key or name). Items in it are NOT deleted.
+    registerEndpoint("/mcp/collections/delete", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function(requestData, sendResponseCallback) {
+            try {
+                let data;
+                try { data = parseBody(requestData); }
+                catch (e) { return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Invalid JSON", message: e.message })); }
+
+                let specs = [];
+                if (Array.isArray(data.keys)) specs = data.keys;
+                else if (data.key) specs = [data.key];
+                else if (data.name) specs = [data.name];
+                if (!specs.length) {
+                    return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: key, keys, or name" }));
+                }
+
+                let permanent = data.permanent === true;
+                let deleted = [], notFound = [];
+
+                for (let spec of specs) {
+                    let col = resolveCollection(spec);
+                    if (!col) { notFound.push(spec); continue; }
+                    let ckey = col.key;
+                    if (permanent) {
+                        await col.eraseTx();
+                    } else {
+                        col.deleted = true;
+                        await col.saveTx();
+                    }
+                    deleted.push(ckey);
+                }
+
+                log("Deleted collections (" + (permanent ? "erased" : "trashed") + "): " + deleted.join(", "));
+                sendResponseCallback(200, "application/json", JSON.stringify({
+                    success: true,
+                    mode: permanent ? "erased" : "trashed",
+                    deleted: deleted,
+                    notFound: notFound
+                }));
+            } catch (e) {
+                log("Error deleting collection: " + e);
                 sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
             }
         }
