@@ -9,8 +9,9 @@ zotero-mcp/
 ├── crates/
 │   ├── zotero-client/      # Rust client library for Zotero API
 │   ├── zotero-mcp/         # MCP server library
-│   └── zotero-mcp-cli/     # CLI binary (zotero-mcp)
-├── zotero-mcp-plugin/      # Zotero 7 plugin for HTTP API
+│   └── zotero-mcp-cli/     # CLI binary (zotero-mcp)  [方法B]
+├── zotero-mcp-plugin/      # Zotero 7/9 plugin for HTTP API (shared backend)
+├── zotero-mcp-py/          # Lightweight Python MCP proxy  [方法C]
 └── .opencode/commands/     # Slash commands for AI workflows
 ```
 
@@ -55,6 +56,39 @@ Add to your MCP configuration (e.g., `~/.config/opencode/mcp.json`):
   }
 }
 ```
+
+## Claude Desktop 対応 / 軽量 Python プロキシ(方法C)
+
+Claude Desktop はシェル実行を持たないため、プラグインの HTTP API を直接 curl で
+叩く「方法A」は使えません。`zotero-mcp-py/` の軽量 Python MCP プロキシを使うと、
+**Claude Code と Claude Desktop の両方**で同じツール(読む/注釈/整理/編集/削除)が
+使えます。Rust ビルド不要(依存はすべて wheel)。
+
+```bash
+pip install -r zotero-mcp-py/requirements.txt
+```
+
+**Claude Desktop** — `%APPDATA%\Claude\claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "zotero-local": {
+      "command": "C:\\path\\to\\python.exe",
+      "args": ["C:\\path\\to\\zotero-mcp\\zotero-mcp-py\\zotero_mcp_proxy.py"],
+      "env": { "ZOTERO_URL": "http://127.0.0.1:23119/mcp" }
+    }
+  }
+}
+```
+
+**Claude Code**(同一スキーマ):
+
+```bash
+claude mcp add zotero-local -e ZOTERO_URL=http://127.0.0.1:23119/mcp -- "C:\\path\\to\\python.exe" "C:\\path\\to\\zotero-mcp\\zotero-mcp-py\\zotero_mcp_proxy.py"
+```
+
+詳細・全ツール一覧は [`zotero-mcp-py/README.md`](zotero-mcp-py/README.md) を参照。
 
 ## Available MCP Tools
 
