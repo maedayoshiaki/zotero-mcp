@@ -28,21 +28,25 @@ claude mcp add --transport http zotero-local http://127.0.0.1:23119/mcp
 claude mcp list        # zotero-local ... ✔ Connected
 ```
 
-Claude then has these tools (each maps to a REST endpoint below):
+Claude then has these 20 tools:
 
-`zotero_ping`, `zotero_search`, `zotero_lookup_citekey`, `zotero_get_item`,
-`zotero_get_children`, `zotero_list_items`, `zotero_create_annotation`,
-`zotero_update_annotation`, `zotero_delete_annotations`, `zotero_create_note`,
-`zotero_update_item`, `zotero_set_tags`, `zotero_set_collections`,
-`zotero_create_collection`, `zotero_delete_collection`, `zotero_add_attachment`,
-`zotero_delete_items`.
+- **Read:** `zotero_ping`, `zotero_search`, `zotero_lookup_citekey`,
+  `zotero_get_item`, `zotero_get_children`, `zotero_list_items`,
+  `zotero_read_pdf`, `zotero_pdf_outline`
+- **Annotate:** `zotero_create_highlight`, `zotero_create_annotation`,
+  `zotero_update_annotation`, `zotero_delete_annotations`
+- **Organize:** `zotero_create_note`, `zotero_update_item`, `zotero_set_tags`,
+  `zotero_set_collections`, `zotero_create_collection`, `zotero_add_attachment`
+- **Delete:** `zotero_delete_items`, `zotero_delete_collection`
 
 Zotero must be running (the server listens on `127.0.0.1:23119`).
 
-> **Note on highlights:** `zotero_create_annotation` places a highlight from an
-> explicit `position: { pageIndex, rects }`. Computing rects from search text
-> (PDF geometry) is not yet done inside the plugin — use the `zotero-mcp-py`
-> proxy or compute rects with PyMuPDF for now. In-plugin geometry is planned.
+> **PDF text & highlights are fully in-plugin (v1.5.0+):** `zotero_read_pdf`,
+> `zotero_pdf_outline`, and `zotero_create_highlight` use a bundled copy of
+> pdf.js (`vendor/`), so highlighting by search text works for **all pages** with
+> no external tool. `zotero_create_highlight` finds the text on the page and
+> computes the rectangles itself. (`zotero_create_annotation` still accepts an
+> explicit `position: { pageIndex, rects }` for area/image annotations.)
 
 The raw MCP endpoint accepts JSON-RPC (`initialize`, `tools/list`, `tools/call`,
 `ping`). Everything below documents the underlying REST API those tools call.

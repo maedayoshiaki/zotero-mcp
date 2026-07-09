@@ -12,7 +12,7 @@ $Xpi = "$PluginName.xpi"
 Remove-Item -Force $Xpi -ErrorAction SilentlyContinue
 
 # XPI is just a ZIP with the files at the archive root
-Compress-Archive -Path manifest.json, bootstrap.js, icon.svg -DestinationPath $Xpi -Force
+Compress-Archive -Path manifest.json, bootstrap.js, icon.svg, vendor -DestinationPath $Xpi -Force
 
 Write-Output "Built $Xpi (v$Version)"
 Write-Output ""

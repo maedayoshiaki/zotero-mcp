@@ -67,18 +67,20 @@ claude mcp add --transport http zotero-local http://127.0.0.1:23119/mcp
 claude mcp list        # zotero-local ... ✔ Connected
 ```
 
-Zotero を起動しておけば、`zotero_search` / `zotero_get_item` / `zotero_create_note` /
-`zotero_set_tags` / `zotero_create_annotation`(注釈は rects 指定)など17ツールが使えます。
+Zotero を起動しておけば、検索・メタデータ・PDF本文読取(`zotero_read_pdf`)・
+目次(`zotero_pdf_outline`)・テキスト検索ハイライト(`zotero_create_highlight`)・
+ノート/タグ/コレクション/削除など **20ツール**が使えます。
 詳細は [`zotero-mcp-plugin/README.md`](zotero-mcp-plugin/README.md) を参照。
 
-> **ハイライトの座標計算**(テキスト→rects)はまだプラグイン内で行いません。
-> 正確なテキストハイライトが必要な間は、下の Python プロキシ(PyMuPDF 同梱)を使うか、
-> PyMuPDF で rects を計算して `zotero_create_annotation` に渡してください。
+> **v1.5.0 で完全内製化:** PDF 本文読取・目次・**テキスト→座標のハイライト**は
+> プラグインに同梱した pdf.js(`vendor/`)で全ページ処理します。**Python プロキシは不要**に
+> なりました(`pip install` すら要りません)。`zotero_create_highlight` にテキストとページを
+> 渡すだけで、プラグインが座標を計算してハイライトを作成します。
 
-### 代替:軽量 Python プロキシ(PyMuPDF でハイライト座標も計算)
+### 代替:軽量 Python プロキシ(任意)
 
-PDF 本文抽出やテキストからのハイライト座標計算までツールで完結させたい場合は
-`zotero-mcp-py/` を使います(依存はすべて wheel、Rust ビルド不要):
+プラグインを入れずに MCP を stdio で使いたい等の事情がある場合は `zotero-mcp-py/`
+も利用できます(依存はすべて wheel、Rust ビルド不要)。通常は上のプラグイン方式で完結します:
 
 ```bash
 pip install -r zotero-mcp-py/requirements.txt

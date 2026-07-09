@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "MCP Zotero API",
-  "version": "1.4.0",
-  "description": "Local HTTP + MCP (Model Context Protocol) endpoints for Zotero: read items/PDF metadata and create/update/delete annotations, notes, tags, collections, attachments, and item fields",
+  "version": "1.5.0",
+  "description": "Local HTTP + MCP (Model Context Protocol) endpoints for Zotero: read items and PDF text/outline, create text-search highlights (bundled pdf.js), and create/update/delete annotations, notes, tags, collections, attachments, and item fields",
   "author": "MCP Zotero",
   "applications": {
     "zotero": {

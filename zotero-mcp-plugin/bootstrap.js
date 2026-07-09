@@ -238,6 +238,35 @@ var MCP_TOOLS = [
             key: { type: "string" },
             permanent: { type: "boolean" }
         } }
+    },
+    {
+        name: "zotero_read_pdf",
+        description: "Extract text from PDF pages locally (all pages supported). key = PDF attachment or item key; pages = 1-based spec like '1-10', '3', or '1,3,5-7'.",
+        method: "POST", path: "/mcp/readpdf",
+        inputSchema: { type: "object", properties: {
+            key: { type: "string" },
+            pages: { type: "string" }
+        }, required: ["key", "pages"] }
+    },
+    {
+        name: "zotero_pdf_outline",
+        description: "Get the PDF outline / table of contents (bookmarks). key = PDF attachment or item key.",
+        method: "POST", path: "/mcp/pdfoutline",
+        inputSchema: { type: "object", properties: {
+            key: { type: "string" }
+        }, required: ["key"] }
+    },
+    {
+        name: "zotero_create_highlight",
+        description: "Create a highlight by searching for text on a page. Rectangles are computed in-plugin via pdf.js (no external tool). Use exact, unique text. key = PDF attachment or item key; page is 1-based; color is #rrggbb; comment is optional (e.g. a translation).",
+        method: "POST", path: "/mcp/highlight",
+        inputSchema: { type: "object", properties: {
+            key: { type: "string" },
+            text: { type: "string" },
+            page: { type: "integer" },
+            color: { type: "string" },
+            comment: { type: "string" }
+        }, required: ["key", "text", "page"] }
     }
 ];
 
@@ -317,6 +346,144 @@ async function mcpDispatch(msg) {
     } catch (e) {
         return rpcError(id, -32603, "Internal error: " + (e && e.message ? e.message : String(e)));
     }
+}
+
+// --------------------------------------------------------------------------- //
+// PDF text + geometry (bundled pdf.js) — powers read/outline/highlight tools.
+// pdf.js runs off-thread via a worker loaded from a file:// copy (jar: workers
+// are unreliable), so the Zotero UI never blocks during parsing.
+// --------------------------------------------------------------------------- //
+var _pdfjs = null;
+var _pdfWorkerURL = null;
+var _pdfDocCache = new Map(); // path -> doc (bounded)
+
+async function _ensurePdfWorkerURL() {
+    if (_pdfWorkerURL) return _pdfWorkerURL;
+    let text = await Zotero.File.getContentsFromURLAsync(MCP_Zotero.rootURI + "vendor/pdf.worker.js");
+    let f = Zotero.getTempDirectory();
+    f.append("mcp-zotero-pdf.worker.js");
+    await IOUtils.writeUTF8(f.path, text);
+    _pdfWorkerURL = Services.io.newFileURI(f).spec;
+    return _pdfWorkerURL;
+}
+
+async function getPdfjs() {
+    if (_pdfjs) return _pdfjs;
+    let win = Zotero.getMainWindow();
+    if (!win.pdfjsLib) {
+        Services.scriptloader.loadSubScript(MCP_Zotero.rootURI + "vendor/pdf.js", win);
+    }
+    _pdfjs = win.pdfjsLib;
+    _pdfjs.GlobalWorkerOptions.workerSrc = await _ensurePdfWorkerURL();
+    return _pdfjs;
+}
+
+async function loadPdfDoc(path) {
+    if (_pdfDocCache.has(path)) return _pdfDocCache.get(path);
+    let pdfjsLib = await getPdfjs();
+    let buf = await IOUtils.read(path);
+    let doc = await pdfjsLib.getDocument({ data: buf, isEvalSupported: false, useWorkerFetch: false }).promise;
+    if (_pdfDocCache.size >= 4) _pdfDocCache.delete(_pdfDocCache.keys().next().value);
+    _pdfDocCache.set(path, doc);
+    return doc;
+}
+
+// Resolve a key (PDF attachment or its parent item) -> { key, id, item, path }.
+async function resolvePdfAttachment(key) {
+    let item = await Zotero.Items.getByLibraryAndKeyAsync(Zotero.Libraries.userLibraryID, key);
+    if (!item) return null;
+    if (item.isAttachment() && item.attachmentContentType === "application/pdf") {
+        return { key: item.key, id: item.id, item: item, path: item.getFilePath() };
+    }
+    if (item.isRegularItem && item.isRegularItem()) {
+        for (let aid of item.getAttachments()) {
+            let att = await Zotero.Items.getAsync(aid);
+            if (att.attachmentContentType === "application/pdf") {
+                return { key: att.key, id: att.id, item: att, path: att.getFilePath() };
+            }
+        }
+    }
+    return null;
+}
+
+// pdf.js text coordinates are already PDF space (bottom-left origin), matching
+// Zotero annotationPosition — no flip needed. Box = baseline ± ascent/descent.
+function _itemBox(it) {
+    let t = it.transform;
+    let h = it.height || Math.hypot(t[2], t[3]) || 0;
+    return { x0: t[4], w: it.width || 0, base: t[5], yB: t[5] - 0.2 * h, yT: t[5] + 0.8 * h };
+}
+
+// Find rectangles (Zotero space) covering `needle` within a page's text items.
+function findTextRects(items, needle) {
+    let full = "";
+    let map = [];
+    for (let i = 0; i < items.length; i++) {
+        let str = items[i].str;
+        for (let j = 0; j < str.length; j++) { full += str[j]; map.push({ i: i, j: j }); }
+    }
+    let hay = full.toLowerCase();
+    let idx = hay.indexOf(String(needle).toLowerCase());
+    if (idx < 0) return { found: false, rects: [] };
+    let start = idx, end = idx + String(needle).length;
+    let per = new Map();
+    for (let k = start; k < end; k++) {
+        let m = map[k];
+        if (!per.has(m.i)) per.set(m.i, { from: m.j, to: m.j });
+        let e = per.get(m.i);
+        e.from = Math.min(e.from, m.j); e.to = Math.max(e.to, m.j);
+    }
+    let pieces = [];
+    for (let [i, r] of per) {
+        let it = items[i]; let b = _itemBox(it); let len = it.str.length || 1;
+        pieces.push({ base: b.base, yB: b.yB, yT: b.yT, xF: b.x0 + (r.from / len) * b.w, xT: b.x0 + ((r.to + 1) / len) * b.w });
+    }
+    let lines = [];
+    for (let p of pieces) {
+        let L = lines.find(function (l) { return Math.abs(l.base - p.base) < 3; });
+        if (!L) { lines.push({ base: p.base, xF: p.xF, xT: p.xT, yB: p.yB, yT: p.yT }); }
+        else { L.xF = Math.min(L.xF, p.xF); L.xT = Math.max(L.xT, p.xT); L.yB = Math.min(L.yB, p.yB); L.yT = Math.max(L.yT, p.yT); }
+    }
+    let round = function (n) { return Math.round(n * 100) / 100; };
+    return { found: true, rects: lines.map(function (L) { return [round(L.xF), round(L.yB), round(L.xT), round(L.yT)]; }) };
+}
+
+function _pdfPageText(tc) {
+    let out = "";
+    for (let it of tc.items) { out += it.str; if (it.hasEOL) out += "\n"; }
+    return out;
+}
+
+function _parsePageSpec(spec, pageCount) {
+    let indices = [];
+    for (let part of String(spec).split(",")) {
+        part = part.trim(); if (!part) continue;
+        let a, b;
+        if (part.indexOf("-") >= 0) { let s = part.split("-"); a = parseInt(s[0]); b = parseInt(s[1]); }
+        else { a = b = parseInt(part); }
+        for (let p = a; p <= b; p++) { if (p >= 1 && p <= pageCount && indices.indexOf(p) < 0) indices.push(p); }
+    }
+    return indices;
+}
+
+async function _extractOutline(doc) {
+    let raw = await doc.getOutline();
+    if (!raw) return [];
+    let result = [];
+    async function walk(items, level) {
+        for (let it of items) {
+            let page = null;
+            try {
+                let dest = it.dest;
+                if (typeof dest === "string") dest = await doc.getDestination(dest);
+                if (Array.isArray(dest) && dest[0]) page = (await doc.getPageIndex(dest[0])) + 1;
+            } catch (e) { /* unresolved destination */ }
+            result.push({ level: level, title: it.title, page: page });
+            if (it.items && it.items.length) await walk(it.items, level + 1);
+        }
+    }
+    await walk(raw, 1);
+    return result;
 }
 
 function install(data, reason) {
@@ -1490,6 +1657,98 @@ function registerEndpoints() {
                 }));
             } catch (e) {
                 log("Error deleting collection: " + e);
+                sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
+            }
+        }
+    });
+
+    // Extract text from PDF pages (bundled pdf.js; all pages, not just first 5)
+    registerEndpoint("/mcp/readpdf", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function (requestData, sendResponseCallback) {
+            try {
+                let data;
+                try { data = parseBody(requestData); }
+                catch (e) { return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Invalid JSON", message: e.message })); }
+                if (!data.key) return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: key" }));
+                if (!data.pages) return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: pages" }));
+                let resolved = await resolvePdfAttachment(data.key);
+                if (!resolved) return sendResponseCallback(404, "application/json", JSON.stringify({ error: "No PDF attachment for key", key: data.key }));
+                let doc = await loadPdfDoc(resolved.path);
+                let idxs = _parsePageSpec(data.pages, doc.numPages);
+                let pages = [], total = 0, cap = 300000;
+                for (let n of idxs) {
+                    let tc = await (await doc.getPage(n)).getTextContent();
+                    let text = _pdfPageText(tc);
+                    if (total + text.length > cap) { pages.push({ page: n, text: text.slice(0, Math.max(0, cap - total)), truncated: true }); break; }
+                    total += text.length; pages.push({ page: n, text: text });
+                }
+                sendResponseCallback(200, "application/json", JSON.stringify({ attachmentKey: resolved.key, pageCount: doc.numPages, pages: pages }));
+            } catch (e) {
+                log("Error reading pdf: " + e);
+                sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
+            }
+        }
+    });
+
+    // PDF outline / table of contents (bundled pdf.js)
+    registerEndpoint("/mcp/pdfoutline", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function (requestData, sendResponseCallback) {
+            try {
+                let data;
+                try { data = parseBody(requestData); }
+                catch (e) { return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Invalid JSON", message: e.message })); }
+                if (!data.key) return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: key" }));
+                let resolved = await resolvePdfAttachment(data.key);
+                if (!resolved) return sendResponseCallback(404, "application/json", JSON.stringify({ error: "No PDF attachment for key", key: data.key }));
+                let doc = await loadPdfDoc(resolved.path);
+                let outline = await _extractOutline(doc);
+                sendResponseCallback(200, "application/json", JSON.stringify({ attachmentKey: resolved.key, pageCount: doc.numPages, outline: outline }));
+            } catch (e) {
+                log("Error getting outline: " + e);
+                sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
+            }
+        }
+    });
+
+    // Create a highlight by searching for text on a page (rects via pdf.js)
+    registerEndpoint("/mcp/highlight", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function (requestData, sendResponseCallback) {
+            try {
+                let data;
+                try { data = parseBody(requestData); }
+                catch (e) { return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Invalid JSON", message: e.message })); }
+                if (!data.key) return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: key" }));
+                if (!data.text) return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: text" }));
+                if (!data.page) return sendResponseCallback(400, "application/json", JSON.stringify({ error: "Missing required field: page (1-based)" }));
+                let resolved = await resolvePdfAttachment(data.key);
+                if (!resolved) return sendResponseCallback(404, "application/json", JSON.stringify({ error: "No PDF attachment for key", key: data.key }));
+                let pageNum = parseInt(data.page);
+                let doc = await loadPdfDoc(resolved.path);
+                if (pageNum < 1 || pageNum > doc.numPages) return sendResponseCallback(400, "application/json", JSON.stringify({ error: "page out of range", range: "1.." + doc.numPages }));
+                let tc = await (await doc.getPage(pageNum)).getTextContent();
+                let res = findTextRects(tc.items, data.text);
+                if (!res.found || !res.rects.length) return sendResponseCallback(404, "application/json", JSON.stringify({ error: "Text not found on page " + pageNum + " (use exact, unique text)" }));
+                let a = new Zotero.Item("annotation");
+                a.libraryID = resolved.item.libraryID;
+                a.parentID = resolved.id;
+                a.annotationType = "highlight";
+                a.annotationText = data.text;
+                a.annotationColor = data.color || "#ffd400";
+                if (data.comment) a.annotationComment = data.comment;
+                a.annotationPageLabel = String(pageNum);
+                a.annotationSortIndex = String(pageNum - 1).padStart(5, "0") + "|000000|00000";
+                a.annotationPosition = JSON.stringify({ pageIndex: pageNum - 1, rects: res.rects });
+                await a.saveTx();
+                log("Created highlight " + a.key + " on " + resolved.key + " p" + pageNum);
+                sendResponseCallback(201, "application/json", JSON.stringify({ success: true, annotation: { key: a.key, parentItemKey: resolved.key, page: pageNum, color: a.annotationColor, rects: res.rects } }));
+            } catch (e) {
+                log("Error creating highlight: " + e);
                 sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
             }
         }

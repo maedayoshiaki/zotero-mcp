@@ -18,7 +18,8 @@ rm -f "${PLUGIN_NAME}.xpi"
 zip -r "${PLUGIN_NAME}.xpi" \
     manifest.json \
     bootstrap.js \
-    icon.svg
+    icon.svg \
+    vendor
 
 echo "Built ${PLUGIN_NAME}.xpi (v${VERSION})"
 echo ""
