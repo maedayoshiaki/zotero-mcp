@@ -1,3 +1,6 @@
 .direnv
 target
 result
+
+# Plugin build artifact (attached to GitHub Releases, not tracked)
+*.xpi
