@@ -56,6 +56,269 @@ function resolveCollection(spec) {
     return null;
 }
 
+// --------------------------------------------------------------------------- //
+// MCP protocol layer (Streamable HTTP, stateless)
+//
+// The /mcp endpoint speaks the Model Context Protocol over HTTP so MCP clients
+// (e.g. Claude Code via `claude mcp add --transport http`) can drive Zotero
+// with NO external runtime. Each tool forwards to one of the REST endpoints
+// above via an internal localhost fetch, so there is a single source of truth.
+// --------------------------------------------------------------------------- //
+
+// Tool registry: name -> REST endpoint. `arguments` map 1:1 onto the REST body.
+var MCP_TOOLS = [
+    {
+        name: "zotero_ping",
+        description: "Health check. Confirms Zotero is running and the plugin is active.",
+        method: "GET", path: "/mcp/ping",
+        inputSchema: { type: "object", properties: {} }
+    },
+    {
+        name: "zotero_search",
+        description: "Search the Zotero library (quicksearch, all fields). Returns matching regular items.",
+        method: "POST", path: "/mcp/search",
+        inputSchema: { type: "object", properties: {
+            query: { type: "string", description: "Search text" },
+            limit: { type: "integer", description: "Max results (default 25)" }
+        }, required: ["query"] }
+    },
+    {
+        name: "zotero_lookup_citekey",
+        description: "Look up an item by its BetterBibTeX citation key. Returns metadata and PDF attachments.",
+        method: "POST", path: "/mcp/citekey",
+        inputSchema: { type: "object", properties: {
+            citekey: { type: "string" }
+        }, required: ["citekey"] }
+    },
+    {
+        name: "zotero_get_item",
+        description: "Get full details of an item by its 8-char key (metadata, creators, attachments with file paths).",
+        method: "POST", path: "/mcp/item",
+        inputSchema: { type: "object", properties: {
+            key: { type: "string" }
+        }, required: ["key"] }
+    },
+    {
+        name: "zotero_get_children",
+        description: "Get child items: attachments/notes for a regular item, or annotations for an attachment.",
+        method: "POST", path: "/mcp/children",
+        inputSchema: { type: "object", properties: {
+            key: { type: "string" }
+        }, required: ["key"] }
+    },
+    {
+        name: "zotero_list_items",
+        description: "List top-level items in the library (excludes attachments/notes/annotations).",
+        method: "POST", path: "/mcp/items",
+        inputSchema: { type: "object", properties: {
+            limit: { type: "integer", description: "Max results (default 50)" }
+        } }
+    },
+    {
+        name: "zotero_create_annotation",
+        description: "Create an annotation on a PDF attachment. For a highlight set annotationType 'highlight' with text; for a figure box use 'image'. Provide position {pageIndex, rects:[[x1,y1,x2,y2],...]} in PDF coordinates (bottom-left origin). color accepts a #rrggbb value.",
+        method: "POST", path: "/mcp/annotations",
+        inputSchema: { type: "object", properties: {
+            parentItemKey: { type: "string", description: "PDF attachment key" },
+            annotationType: { type: "string", enum: ["highlight", "image", "note", "ink"], description: "Default 'highlight'" },
+            text: { type: "string", description: "Highlighted text (for highlights)" },
+            comment: { type: "string", description: "Note/translation attached to the annotation" },
+            color: { type: "string", description: "#rrggbb (default #ffd400)" },
+            pageLabel: { type: "string" },
+            sortIndex: { type: "string" },
+            position: { type: "object", description: "{ pageIndex, rects:[[x1,y1,x2,y2],...] }" }
+        }, required: ["parentItemKey"] }
+    },
+    {
+        name: "zotero_update_annotation",
+        description: "Update an existing annotation. Only provided fields change. tags replaces the tag set.",
+        method: "POST", path: "/mcp/annotations/update",
+        inputSchema: { type: "object", properties: {
+            key: { type: "string" },
+            comment: { type: "string" },
+            color: { type: "string" },
+            text: { type: "string" },
+            pageLabel: { type: "string" },
+            position: { type: "object" },
+            tags: { type: "array", items: { type: "string" } }
+        }, required: ["key"] }
+    },
+    {
+        name: "zotero_delete_annotations",
+        description: "Delete annotation(s) by key. permanent=false trashes; permanent=true erases entirely.",
+        method: "POST", path: "/mcp/annotations/delete",
+        inputSchema: { type: "object", properties: {
+            keys: { type: "array", items: { type: "string" } },
+            key: { type: "string" },
+            permanent: { type: "boolean" }
+        } }
+    },
+    {
+        name: "zotero_create_note",
+        description: "Create a note (HTML/text). With parentItemKey it becomes a child note; otherwise standalone (collections apply only to standalone).",
+        method: "POST", path: "/mcp/notes",
+        inputSchema: { type: "object", properties: {
+            note: { type: "string" },
+            parentItemKey: { type: "string" },
+            tags: { type: "array", items: { type: "string" } },
+            collections: { type: "array", items: { type: "string" }, description: "Collection keys or names" }
+        }, required: ["note"] }
+    },
+    {
+        name: "zotero_update_item",
+        description: "Update an item. fields is a name->value map (invalid ones skipped); creators is Zotero creators JSON; note sets note content for note items.",
+        method: "POST", path: "/mcp/items/update",
+        inputSchema: { type: "object", properties: {
+            key: { type: "string" },
+            fields: { type: "object" },
+            creators: { type: "array", items: { type: "object" } },
+            note: { type: "string" }
+        }, required: ["key"] }
+    },
+    {
+        name: "zotero_set_tags",
+        description: "Modify tags on an item. Use replace to set the whole set, or add/remove for incremental changes.",
+        method: "POST", path: "/mcp/tags",
+        inputSchema: { type: "object", properties: {
+            key: { type: "string" },
+            add: { type: "array", items: { type: "string" } },
+            remove: { type: "array", items: { type: "string" } },
+            replace: { type: "array", items: { type: "string" } }
+        }, required: ["key"] }
+    },
+    {
+        name: "zotero_set_collections",
+        description: "Add/remove an item to/from collections (referenced by 8-char key or name).",
+        method: "POST", path: "/mcp/collections",
+        inputSchema: { type: "object", properties: {
+            key: { type: "string" },
+            add: { type: "array", items: { type: "string" } },
+            remove: { type: "array", items: { type: "string" } }
+        }, required: ["key"] }
+    },
+    {
+        name: "zotero_create_collection",
+        description: "Create a new collection, optionally nested under parent (key or name).",
+        method: "POST", path: "/mcp/collections/create",
+        inputSchema: { type: "object", properties: {
+            name: { type: "string" },
+            parent: { type: "string" }
+        }, required: ["name"] }
+    },
+    {
+        name: "zotero_delete_collection",
+        description: "Delete a collection by key or name. Items inside are NOT deleted. permanent=true erases.",
+        method: "POST", path: "/mcp/collections/delete",
+        inputSchema: { type: "object", properties: {
+            key: { type: "string" },
+            name: { type: "string" },
+            keys: { type: "array", items: { type: "string" } },
+            permanent: { type: "boolean" }
+        } }
+    },
+    {
+        name: "zotero_add_attachment",
+        description: "Add an attachment. Provide either a local path or a url. linkMode: imported_file|linked_file|imported_url|linked_url.",
+        method: "POST", path: "/mcp/attachments",
+        inputSchema: { type: "object", properties: {
+            parentItemKey: { type: "string" },
+            path: { type: "string" },
+            url: { type: "string" },
+            title: { type: "string" },
+            linkMode: { type: "string" },
+            contentType: { type: "string" }
+        } }
+    },
+    {
+        name: "zotero_delete_items",
+        description: "Delete item(s) of any type (regular/note/attachment/annotation) by key. permanent=true erases.",
+        method: "POST", path: "/mcp/items/delete",
+        inputSchema: { type: "object", properties: {
+            keys: { type: "array", items: { type: "string" } },
+            key: { type: "string" },
+            permanent: { type: "boolean" }
+        } }
+    }
+];
+
+function rpcResult(id, result) { return { jsonrpc: "2.0", id: id, result: result }; }
+function rpcError(id, code, message) { return { jsonrpc: "2.0", id: id, error: { code: code, message: message } }; }
+
+// Invoke one of this plugin's own registered endpoints IN-PROCESS (no HTTP).
+// A re-entrant fetch to Zotero's own server deadlocks/NetworkErrors, so instead
+// we call the endpoint's init() directly with a capturing sendResponseCallback.
+// This reuses all existing REST endpoint logic without any duplication.
+async function mcpCallEndpoint(path, body) {
+    let Ep = Zotero.Server.Endpoints[path];
+    if (!Ep) {
+        return { ok: false, body: { error: "No endpoint registered: " + path } };
+    }
+    let instance = new Ep();
+    let captured = null;
+    let resolveDone;
+    let done = new Promise(function (resolve) { resolveDone = resolve; });
+    let sendResponseCallback = function (status, contentType, respBody) {
+        captured = { status: status, body: respBody };
+        resolveDone();
+    };
+    // init may be sync or async; run it, then wait for the callback to fire.
+    let initResult = instance.init(body || {}, sendResponseCallback);
+    if (initResult && typeof initResult.then === "function") {
+        await initResult;
+    }
+    await done;
+    let json;
+    try { json = JSON.parse(captured.body); }
+    catch (e) { json = { raw: captured.body }; }
+    return { ok: captured.status < 400, body: json };
+}
+
+// Handle a single JSON-RPC message. Returns a response object, or null for
+// notifications (messages without an id).
+async function mcpDispatch(msg) {
+    if (!msg || msg.id === undefined) {
+        return null; // notification (e.g. notifications/initialized) -> no response
+    }
+    let id = msg.id;
+    let method = msg.method;
+    try {
+        if (method === "initialize") {
+            let pv = (msg.params && msg.params.protocolVersion) || "2025-06-18";
+            return rpcResult(id, {
+                protocolVersion: pv,
+                capabilities: { tools: { listChanged: false } },
+                serverInfo: { name: "zotero-mcp", version: MCP_Zotero.version }
+            });
+        }
+        if (method === "ping") {
+            return rpcResult(id, {});
+        }
+        if (method === "tools/list") {
+            return rpcResult(id, {
+                tools: MCP_TOOLS.map(function (t) {
+                    return { name: t.name, description: t.description, inputSchema: t.inputSchema };
+                })
+            });
+        }
+        if (method === "tools/call") {
+            let name = msg.params && msg.params.name;
+            let args = (msg.params && msg.params.arguments) || {};
+            let tool = MCP_TOOLS.find(function (t) { return t.name === name; });
+            if (!tool) {
+                return rpcError(id, -32602, "Unknown tool: " + name);
+            }
+            let res = await mcpCallEndpoint(tool.path, args);
+            return rpcResult(id, {
+                content: [{ type: "text", text: JSON.stringify(res.body) }],
+                isError: !res.ok
+            });
+        }
+        return rpcError(id, -32601, "Method not found: " + method);
+    } catch (e) {
+        return rpcError(id, -32603, "Internal error: " + (e && e.message ? e.message : String(e)));
+    }
+}
+
 function install(data, reason) {
     log("Plugin installed");
 }
@@ -1228,6 +1491,46 @@ function registerEndpoints() {
             } catch (e) {
                 log("Error deleting collection: " + e);
                 sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));
+            }
+        }
+    });
+
+    // MCP protocol endpoint (Streamable HTTP, stateless). Point MCP clients here:
+    //   claude mcp add --transport http zotero http://127.0.0.1:23119/mcp
+    registerEndpoint("/mcp", {
+        supportedMethods: ["POST"],
+        supportedDataTypes: ["application/json", "text/plain"],
+        init: async function (requestData, sendResponseCallback) {
+            try {
+                let data;
+                try {
+                    data = parseBody(requestData);
+                } catch (e) {
+                    return sendResponseCallback(200, "application/json",
+                        JSON.stringify(rpcError(null, -32700, "Parse error: " + e.message)));
+                }
+
+                if (Array.isArray(data)) {
+                    let responses = [];
+                    for (let msg of data) {
+                        let r = await mcpDispatch(msg);
+                        if (r) responses.push(r);
+                    }
+                    if (!responses.length) {
+                        return sendResponseCallback(202, "application/json", "");
+                    }
+                    return sendResponseCallback(200, "application/json", JSON.stringify(responses));
+                }
+
+                let r = await mcpDispatch(data);
+                if (!r) {
+                    return sendResponseCallback(202, "application/json", "");
+                }
+                return sendResponseCallback(200, "application/json", JSON.stringify(r));
+            } catch (e) {
+                log("MCP endpoint error: " + e);
+                sendResponseCallback(200, "application/json",
+                    JSON.stringify(rpcError(null, -32603, "Internal error: " + (e && e.message ? e.message : String(e)))));
             }
         }
     });

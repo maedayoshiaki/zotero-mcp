@@ -1,14 +1,51 @@
 # MCP Zotero API Plugin
 
-A Zotero 7 plugin that exposes HTTP endpoints for external tools (like MCP servers) to create annotations and modify Zotero items while Zotero is running.
+A Zotero 7/9 plugin that exposes, while Zotero is running:
+
+1. A **native MCP server over HTTP** at `http://127.0.0.1:23119/mcp` — connect
+   Claude Code directly, no external runtime required (recommended).
+2. A **REST API** at `http://127.0.0.1:23119/mcp/...` for scripts/tools that
+   prefer plain HTTP (curl/Python).
 
 ## Installation
 
-1. Build the XPI: `./build.sh`
+1. Build the XPI: `./build.sh` (macOS/Linux) or `./build.ps1` (Windows)
 2. In Zotero, go to **Tools → Add-ons**
 3. Click the gear icon and select **Install Add-on From File...**
 4. Select the `mcp-zotero-api.xpi` file
 5. Restart Zotero
+
+Released builds can be downloaded from the repository's GitHub Releases; once
+installed, Zotero auto-updates the plugin via `updates.json`.
+
+## MCP integration (Claude Code)
+
+The plugin **is** an MCP server (Streamable HTTP, stateless). Register it in
+Claude Code with one command — no Python, Node, or separate process:
+
+```bash
+claude mcp add --transport http zotero-local http://127.0.0.1:23119/mcp
+claude mcp list        # zotero-local ... ✔ Connected
+```
+
+Claude then has these tools (each maps to a REST endpoint below):
+
+`zotero_ping`, `zotero_search`, `zotero_lookup_citekey`, `zotero_get_item`,
+`zotero_get_children`, `zotero_list_items`, `zotero_create_annotation`,
+`zotero_update_annotation`, `zotero_delete_annotations`, `zotero_create_note`,
+`zotero_update_item`, `zotero_set_tags`, `zotero_set_collections`,
+`zotero_create_collection`, `zotero_delete_collection`, `zotero_add_attachment`,
+`zotero_delete_items`.
+
+Zotero must be running (the server listens on `127.0.0.1:23119`).
+
+> **Note on highlights:** `zotero_create_annotation` places a highlight from an
+> explicit `position: { pageIndex, rects }`. Computing rects from search text
+> (PDF geometry) is not yet done inside the plugin — use the `zotero-mcp-py`
+> proxy or compute rects with PyMuPDF for now. In-plugin geometry is planned.
+
+The raw MCP endpoint accepts JSON-RPC (`initialize`, `tools/list`, `tools/call`,
+`ping`). Everything below documents the underlying REST API those tools call.
 
 ## API Endpoints
 
@@ -157,14 +194,24 @@ The plugin is a bootstrapped Zotero 7 plugin using the standard WebExtension-sty
 
 ### Files
 
-- `manifest.json` - Plugin metadata
-- `bootstrap.js` - Main plugin code with HTTP endpoint registration
+- `manifest.json` - Plugin metadata and version (single source of truth)
+- `bootstrap.js` - HTTP endpoint registration, REST handlers, and MCP layer
 - `icon.svg` - Plugin icon
+- `updates.json` - Zotero auto-update manifest (bump when releasing)
 
 ### Building
 
 ```bash
-./build.sh
+./build.sh        # macOS/Linux (needs `zip`)
+./build.ps1       # Windows PowerShell (no `zip` needed)
 ```
 
 This creates `mcp-zotero-api.xpi` which can be installed in Zotero.
+
+### Releasing
+
+1. Bump `version` in `manifest.json` and the matching entry in `updates.json`.
+2. Build the XPI.
+3. Create a GitHub Release tagged `vX.Y.Z` and attach `mcp-zotero-api.xpi`.
+   The `update_link` in `updates.json` points at that release asset, so
+   installed users auto-update.

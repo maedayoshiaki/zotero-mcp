@@ -57,34 +57,31 @@ Add to your MCP configuration (e.g., `~/.config/opencode/mcp.json`):
 }
 ```
 
-## Claude Desktop 対応 / 軽量 Python プロキシ(方法C)
+## Claude Code から使う(推奨:プラグインネイティブ MCP)
 
-Claude Desktop はシェル実行を持たないため、プラグインの HTTP API を直接 curl で
-叩く「方法A」は使えません。`zotero-mcp-py/` の軽量 Python MCP プロキシを使うと、
-**Claude Code と Claude Desktop の両方**で同じツール(読む/注釈/整理/編集/削除)が
-使えます。Rust ビルド不要(依存はすべて wheel)。
+`zotero-mcp-plugin`(v1.4.0+)は **それ自体が MCP サーバ**(Streamable HTTP)です。
+xpi を入れて Claude Code に URL を1行登録するだけ。**Python も Rust も別プロセスも不要**:
+
+```bash
+claude mcp add --transport http zotero-local http://127.0.0.1:23119/mcp
+claude mcp list        # zotero-local ... ✔ Connected
+```
+
+Zotero を起動しておけば、`zotero_search` / `zotero_get_item` / `zotero_create_note` /
+`zotero_set_tags` / `zotero_create_annotation`(注釈は rects 指定)など17ツールが使えます。
+詳細は [`zotero-mcp-plugin/README.md`](zotero-mcp-plugin/README.md) を参照。
+
+> **ハイライトの座標計算**(テキスト→rects)はまだプラグイン内で行いません。
+> 正確なテキストハイライトが必要な間は、下の Python プロキシ(PyMuPDF 同梱)を使うか、
+> PyMuPDF で rects を計算して `zotero_create_annotation` に渡してください。
+
+### 代替:軽量 Python プロキシ(PyMuPDF でハイライト座標も計算)
+
+PDF 本文抽出やテキストからのハイライト座標計算までツールで完結させたい場合は
+`zotero-mcp-py/` を使います(依存はすべて wheel、Rust ビルド不要):
 
 ```bash
 pip install -r zotero-mcp-py/requirements.txt
-```
-
-**Claude Desktop** — `%APPDATA%\Claude\claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "zotero-local": {
-      "command": "C:\\path\\to\\python.exe",
-      "args": ["C:\\path\\to\\zotero-mcp\\zotero-mcp-py\\zotero_mcp_proxy.py"],
-      "env": { "ZOTERO_URL": "http://127.0.0.1:23119/mcp" }
-    }
-  }
-}
-```
-
-**Claude Code**(同一スキーマ):
-
-```bash
 claude mcp add zotero-local -e ZOTERO_URL=http://127.0.0.1:23119/mcp -- "C:\\path\\to\\python.exe" "C:\\path\\to\\zotero-mcp\\zotero-mcp-py\\zotero_mcp_proxy.py"
 ```
 

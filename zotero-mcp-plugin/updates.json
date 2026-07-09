@@ -1,0 +1,17 @@
+{
+  "addons": {
+    "mcp-zotero-api@mcp.local": {
+      "updates": [
+        {
+          "version": "1.4.0",
+          "update_link": "https://github.com/maedayoshiaki/zotero-mcp/releases/download/v1.4.0/mcp-zotero-api.xpi",
+          "applications": {
+            "zotero": {
+              "strict_min_version": "7.0.0"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
