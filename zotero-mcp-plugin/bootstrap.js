@@ -57,6 +57,90 @@ function resolveCollection(spec) {
 }
 
 // --------------------------------------------------------------------------- //
+// BetterBibTeX bridge
+//
+// BBT runs as a plugin in this same process, so its key store is reachable
+// directly. Do NOT go over BBT's JSON-RPC endpoint: Zotero cannot reliably
+// connect to its own HTTP server from inside itself (the request fails with a
+// connection error), even though the same endpoint answers external clients.
+
+// The BBT key store, or null when BetterBibTeX is not installed/started.
+// Entries are { itemID, itemKey, libraryID, citationKey }.
+function bbtKeyManager() {
+    try {
+        return (Zotero.BetterBibTeX && Zotero.BetterBibTeX.KeyManager) || null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// Citation key for one item, or null when BBT has no key for it.
+// Never throws: callers use this to decorate responses, not to gate them.
+function bbtCitationKey(item) {
+    let km = bbtKeyManager();
+    if (km) {
+        try {
+            let entry = km.get(item.id);
+            if (entry && entry.citationKey) {
+                return entry.citationKey;
+            }
+        } catch (e) {
+            log("BetterBibTeX KeyManager.get failed: " + e);
+        }
+    }
+    // BBT 9 also surfaces the key as a Zotero item field.
+    try {
+        return item.getField('citationKey') || null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// Resolve a BetterBibTeX citation key to an item in the user library.
+// Exact match wins; a case-insensitive match is accepted as a fallback because
+// BBT keys are case-sensitive by default but people typing them are not.
+// Returns { item, citekey } or null. Reasons for failure are pushed onto
+// `diagnostics` so a 404 can explain itself instead of failing silently.
+async function resolveCitekey(citekey, diagnostics) {
+    let km = bbtKeyManager();
+    if (!km) {
+        diagnostics.push("BetterBibTeX is not available (Zotero.BetterBibTeX.KeyManager missing)");
+        return null;
+    }
+
+    let libraryID = Zotero.Libraries.userLibraryID;
+    let entry;
+    try {
+        entry = km.any(k => k.libraryID === libraryID && k.citationKey === citekey);
+        if (!entry) {
+            let lower = citekey.toLowerCase();
+            entry = km.any(k => k.libraryID === libraryID
+                && typeof k.citationKey === 'string'
+                && k.citationKey.toLowerCase() === lower);
+            if (entry) {
+                diagnostics.push('matched "' + entry.citationKey + '" case-insensitively');
+            }
+        }
+    } catch (e) {
+        diagnostics.push("BetterBibTeX KeyManager lookup failed: " + e.message);
+        log("BetterBibTeX KeyManager lookup failed: " + e);
+        return null;
+    }
+
+    if (!entry) {
+        diagnostics.push('no item in the user library has citation key "' + citekey + '"');
+        return null;
+    }
+
+    let item = await Zotero.Items.getAsync(entry.itemID);
+    if (!item) {
+        diagnostics.push("citation key maps to item " + entry.itemID + ", which could not be loaded");
+        return null;
+    }
+    return { item: item, citekey: entry.citationKey };
+}
+
+// --------------------------------------------------------------------------- //
 // MCP protocol layer (Streamable HTTP, stateless)
 //
 // The /mcp endpoint speaks the Model Context Protocol over HTTP so MCP clients
@@ -92,7 +176,7 @@ var MCP_TOOLS = [
     },
     {
         name: "zotero_get_item",
-        description: "Get full details of an item by its 8-char key (metadata, creators, attachments with file paths).",
+        description: "Get full details of an item by its 8-char key (metadata, creators, BetterBibTeX citekey, attachments with file paths).",
         method: "POST", path: "/mcp/item",
         inputSchema: { type: "object", properties: {
             key: { type: "string" }
@@ -742,6 +826,8 @@ function registerEndpoints() {
                     itemData.url = item.getField('url');
                     itemData.DOI = item.getField('DOI');
                     itemData.extra = item.getField('extra');
+                    // null when BetterBibTeX is absent or has no key for this item
+                    itemData.citekey = bbtCitationKey(item);
                     
                     // Get attachments
                     let attachmentIDs = item.getAttachments();
@@ -1052,41 +1138,19 @@ function registerEndpoints() {
                     return;
                 }
                 
-                // Call BetterBibTeX's JSON-RPC API to search by citekey
+                // Resolve through BetterBibTeX's in-process key store.
                 let item = null;
-                
-                try {
-                    // Use fetch to call BBT's JSON-RPC endpoint
-                    let response = await fetch('http://127.0.0.1:23119/better-bibtex/json-rpc', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            jsonrpc: '2.0',
-                            method: 'item.search',
-                            params: [citekey],
-                            id: 1
-                        })
-                    });
-                    
-                    if (response.ok) {
-                        let result = await response.json();
-                        if (result.result && result.result.length > 0) {
-                            // Extract the item key from the ID URL
-                            // Format: "http://zotero.org/users/XXXXX/items/ITEMKEY"
-                            let idUrl = result.result[0].id;
-                            let itemKey = idUrl.split('/').pop();
-                            
-                            item = await Zotero.Items.getByLibraryAndKeyAsync(
-                                Zotero.Libraries.userLibraryID,
-                                itemKey
-                            );
-                        }
-                    }
-                } catch (e) {
-                    log("BetterBibTeX JSON-RPC lookup failed: " + e);
+                let diagnostics = [];
+
+                let resolved = await resolveCitekey(citekey, diagnostics);
+                if (resolved) {
+                    item = resolved.item;
+                    // Report the key BBT actually holds, not what was asked for.
+                    citekey = resolved.citekey;
                 }
                 
-                // Fallback: search in extra field
+                // Fallback: a pinned citation key is stored in the item's Extra
+                // field, so it is findable even when BBT is not answering.
                 if (!item) {
                     let s = new Zotero.Search();
                     s.libraryID = Zotero.Libraries.userLibraryID;
@@ -1108,9 +1172,12 @@ function registerEndpoints() {
                 }
                 
                 if (!item) {
+                    diagnostics.push("no item had a pinned \"Citation Key: "
+                        + citekey + "\" in its Extra field");
                     sendResponseCallback(404, "application/json", JSON.stringify({
                         error: "Item not found for citekey",
-                        citekey: citekey
+                        citekey: citekey,
+                        diagnostics: diagnostics
                     }));
                     return;
                 }
