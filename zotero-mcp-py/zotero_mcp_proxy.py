@@ -143,6 +143,81 @@ def _rects_to_zotero(rects: list, page_height: float) -> list[list[float]]:
     return out
 
 
+def _find_text_rects(pg, needle: str, occurrence: Optional[int] = None) -> dict:
+    """
+    Find `needle` on a PyMuPDF page and return the rectangles (PyMuPDF
+    top-left space, one per text line) of exactly ONE match.
+
+    Mirrors findTextRects() in the Zotero plugin: exact-case matches are
+    preferred and case-insensitive matching is only a fallback. Lines are
+    joined with a single space so a phrase may span a line break. If several
+    matches remain and `occurrence` (1-based, reading order) is not given,
+    nothing is picked and every candidate is returned instead of silently
+    using the first one.
+    """
+    full: list[str] = []
+    boxes: list = []  # per character: (line_id, Rect) or None for a separator
+    raw = pg.get_text("rawdict", flags=0)
+    line_id = 0
+    for block in raw.get("blocks", []):
+        for line in block.get("lines", []):
+            if full:
+                full.append(" ")
+                boxes.append(None)
+            for span in line.get("spans", []):
+                for ch in span.get("chars", []):
+                    full.append(ch["c"])
+                    boxes.append((line_id, pymupdf.Rect(ch["bbox"])))
+            line_id += 1
+    hay = "".join(full)
+
+    def all_indices(h: str, n: str) -> list[int]:
+        out, k = [], h.find(n)
+        while k >= 0:
+            out.append(k)
+            k = h.find(n, k + 1)
+        return out
+
+    def rects_for(start: int) -> list:
+        per_line: dict = {}
+        for b in boxes[start:start + len(needle)]:
+            if b is None:
+                continue
+            lid, r = b
+            per_line[lid] = per_line[lid] | r if lid in per_line else pymupdf.Rect(r)
+        return list(per_line.values())
+
+    case_sensitive = True
+    starts = all_indices(hay, needle)
+    if not starts:
+        case_sensitive = False
+        starts = all_indices(hay.lower(), needle.lower())
+    if not starts:
+        return {"found": False, "count": 0, "rects": []}
+
+    def candidates() -> list[dict]:
+        return [
+            {
+                "occurrence": n + 1,
+                "context": hay[max(0, k - 40):k + len(needle) + 40],
+                "rects": rects_for(k),
+            }
+            for n, k in enumerate(starts)
+        ]
+
+    if occurrence is not None:
+        if not 1 <= occurrence <= len(starts):
+            return {"found": True, "outOfRange": True, "count": len(starts),
+                    "caseSensitive": case_sensitive, "rects": [], "candidates": candidates()}
+        return {"found": True, "count": len(starts), "caseSensitive": case_sensitive,
+                "occurrence": occurrence, "rects": rects_for(starts[occurrence - 1])}
+    if len(starts) > 1:
+        return {"found": True, "ambiguous": True, "count": len(starts),
+                "caseSensitive": case_sensitive, "rects": [], "candidates": candidates()}
+    return {"found": True, "count": 1, "caseSensitive": case_sensitive,
+            "occurrence": 1, "rects": rects_for(starts[0])}
+
+
 def _parse_pages(spec: str, page_count: int) -> list[int]:
     """Parse a 1-based page spec like '1-10', '3', '1,3,5-7' -> 0-based indices."""
     indices: list[int] = []
@@ -265,20 +340,26 @@ def zotero_create_highlight(
     page: int,
     color: str = "yellow",
     comment: Optional[str] = None,
+    occurrence: Optional[int] = None,
 ) -> dict:
     """
     Create a highlight annotation on a PDF page.
 
     Finds `text` on 1-based `page` with PyMuPDF, computes Zotero-space
-    rectangles (bottom-left origin), and posts the annotation. Use text that is
-    UNIQUE on the page to avoid matching the wrong occurrence.
+    rectangles (bottom-left origin), and posts the annotation. Exact-case
+    matches are preferred; case-insensitive matching is used only when there
+    is no exact-case match. If the text matches more than one place on the
+    page, nothing is created and the error lists every candidate; then use
+    longer, unique text or pass `occurrence`.
 
-    key     : PDF attachment key (or item key; first PDF is used).
-    text    : exact text to highlight (unique substring on the page).
-    page    : 1-based page number.
-    color   : semantic name (section1/section2/section3/positive/detail/
-              negative/code/yellow) or a raw "#rrggbb" value.
-    comment : optional note (e.g. a translation) attached to the highlight.
+    key        : PDF attachment key (or item key; first PDF is used).
+    text       : exact text to highlight (unique substring on the page).
+    page       : 1-based page number.
+    color      : semantic name (section1/section2/section3/positive/detail/
+                 negative/code/yellow) or a raw "#rrggbb" value.
+    comment    : optional note (e.g. a translation) attached to the highlight.
+    occurrence : 1-based index of the match on the page (reading order) when
+                 the text is not unique. Omit to require a unique match.
     """
     attachment_key, path = _resolve_pdf(key)
     doc = pymupdf.open(path)
@@ -286,14 +367,26 @@ def zotero_create_highlight(
         if not (1 <= page <= doc.page_count):
             raise RuntimeError(f"page {page} out of range (1..{doc.page_count})")
         pg = doc.load_page(page - 1)
-        rects = pg.search_for(text)
-        if not rects:
-            raise RuntimeError(
-                f"Text not found on page {page}. Use an exact, unique substring "
-                f"(search is case- and whitespace-sensitive)."
-            )
+        res = _find_text_rects(pg, text, occurrence)
         page_height = float(pg.rect.height)
-        zrects = _rects_to_zotero(rects, page_height)
+        if not res["found"] or (not res["rects"] and not res.get("candidates")):
+            raise RuntimeError(
+                f"Text not found on page {page}. Use an exact, unique substring."
+            )
+        if res.get("ambiguous") or res.get("outOfRange"):
+            listing = "\n".join(
+                f"  occurrence={c['occurrence']}: ...{' '.join(c['context'].split())}... "
+                f"rects={[[round(v, 2) for v in r] for r in _rects_to_zotero(c['rects'], page_height)]}"
+                for c in res["candidates"]
+            )
+            head = (
+                f"occurrence must be 1..{res['count']}"
+                if res.get("outOfRange")
+                else f"Text matches {res['count']} places on page {page}; nothing was created. "
+                     f"Use longer text that is unique on the page, or pass occurrence (1-based)"
+            )
+            raise RuntimeError(f"{head}. Candidates:\n{listing}")
+        zrects = _rects_to_zotero(res["rects"], page_height)
     finally:
         doc.close()
 
