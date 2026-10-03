@@ -47,6 +47,16 @@ Zotero must be running (the server listens on `127.0.0.1:23119`).
 > no external tool. `zotero_create_highlight` finds the text on the page and
 > computes the rectangles itself. (`zotero_create_annotation` still accepts an
 > explicit `position: { pageIndex, rects }` for area/image annotations.)
+>
+> **Repeated text on a page (v1.5.3+):** `zotero_create_highlight` prefers
+> exact-case matches and falls back to case-insensitive matching only when there
+> is no exact-case match. If the text still matches more than one place, it
+> creates nothing and returns HTTP 409 with every candidate (`occurrence`,
+> surrounding `context`, `rects`). Retry with longer text that is unique on the
+> page, or pass `occurrence` (1-based, pdf.js reading order) to pick one.
+> Earlier versions silently highlighted the first case-insensitive match, so a
+> section heading such as "Real-scene box" could land on an earlier
+> "real-scene box" in the body text.
 
 The raw MCP endpoint accepts JSON-RPC (`initialize`, `tools/list`, `tools/call`,
 `ping`). Everything below documents the underlying REST API those tools call.

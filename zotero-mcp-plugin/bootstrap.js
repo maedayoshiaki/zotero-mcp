@@ -342,12 +342,13 @@ var MCP_TOOLS = [
     },
     {
         name: "zotero_create_highlight",
-        description: "Create a highlight by searching for text on a page. Rectangles are computed in-plugin via pdf.js (no external tool). Use exact, unique text. key = PDF attachment or item key; page is 1-based; color is #rrggbb; comment is optional (e.g. a translation).",
+        description: "Create a highlight by searching for text on a page. Rectangles are computed in-plugin via pdf.js (no external tool). Exact-case matches are preferred; case-insensitive matching is used only when there is no exact-case match. If the text matches more than one place on the page, nothing is created and an error lists every candidate (context + rects); then use longer, unique text or pass occurrence. key = PDF attachment or item key; page is 1-based; color is #rrggbb; comment is optional (e.g. a translation).",
         method: "POST", path: "/mcp/highlight",
         inputSchema: { type: "object", properties: {
             key: { type: "string" },
             text: { type: "string" },
             page: { type: "integer" },
+            occurrence: { type: "integer", description: "1-based index of the match on the page (pdf.js reading order) when the text is not unique. Omit to require a unique match." },
             color: { type: "string" },
             comment: { type: "string" }
         }, required: ["key", "text", "page"] }
@@ -498,20 +499,10 @@ function _itemBox(it) {
     return { x0: t[4], w: it.width || 0, base: t[5], yB: t[5] - 0.2 * h, yT: t[5] + 0.8 * h };
 }
 
-// Find rectangles (Zotero space) covering `needle` within a page's text items.
-function findTextRects(items, needle) {
-    let full = "";
-    let map = [];
-    for (let i = 0; i < items.length; i++) {
-        let str = items[i].str;
-        for (let j = 0; j < str.length; j++) { full += str[j]; map.push({ i: i, j: j }); }
-    }
-    let hay = full.toLowerCase();
-    let idx = hay.indexOf(String(needle).toLowerCase());
-    if (idx < 0) return { found: false, rects: [] };
-    let start = idx, end = idx + String(needle).length;
+// Rectangles (Zotero space) covering full[start, start+len) of a page's text items.
+function _matchRects(items, map, start, len) {
     let per = new Map();
-    for (let k = start; k < end; k++) {
+    for (let k = start; k < start + len; k++) {
         let m = map[k];
         if (!per.has(m.i)) per.set(m.i, { from: m.j, to: m.j });
         let e = per.get(m.i);
@@ -529,7 +520,49 @@ function findTextRects(items, needle) {
         else { L.xF = Math.min(L.xF, p.xF); L.xT = Math.max(L.xT, p.xT); L.yB = Math.min(L.yB, p.yB); L.yT = Math.max(L.yT, p.yT); }
     }
     let round = function (n) { return Math.round(n * 100) / 100; };
-    return { found: true, rects: lines.map(function (L) { return [round(L.xF), round(L.yB), round(L.xT), round(L.yT)]; }) };
+    return lines.map(function (L) { return [round(L.xF), round(L.yB), round(L.xT), round(L.yT)]; });
+}
+
+// Find `needle` within a page's text items and return the rectangles of ONE match.
+// Case-sensitive matches are preferred; case-insensitive is only a fallback when
+// there is no exact-case match. If several matches remain and `occurrence`
+// (1-based, in pdf.js reading order) is not given, nothing is picked: the caller
+// gets `ambiguous` with every candidate so it can choose instead of silently
+// highlighting the first one.
+function findTextRects(items, needle, occurrence) {
+    let full = "";
+    let map = [];
+    for (let i = 0; i < items.length; i++) {
+        let str = items[i].str;
+        for (let j = 0; j < str.length; j++) { full += str[j]; map.push({ i: i, j: j }); }
+    }
+    needle = String(needle);
+    let allIndices = function (hay, n) {
+        let out = [];
+        for (let k = hay.indexOf(n); k >= 0; k = hay.indexOf(n, k + 1)) out.push(k);
+        return out;
+    };
+    let caseSensitive = true;
+    let starts = allIndices(full, needle);
+    if (!starts.length) { caseSensitive = false; starts = allIndices(full.toLowerCase(), needle.toLowerCase()); }
+    if (!starts.length) return { found: false, count: 0, rects: [] };
+    let candidates = function () {
+        return starts.map(function (k, n) {
+            let a = Math.max(0, k - 40), b = Math.min(full.length, k + needle.length + 40);
+            return { occurrence: n + 1, context: full.slice(a, b), rects: _matchRects(items, map, k, needle.length) };
+        });
+    };
+    if (occurrence !== undefined && occurrence !== null && occurrence !== "") {
+        let n = parseInt(occurrence);
+        if (!(n >= 1 && n <= starts.length)) {
+            return { found: true, outOfRange: true, count: starts.length, caseSensitive: caseSensitive, rects: [], candidates: candidates() };
+        }
+        return { found: true, count: starts.length, caseSensitive: caseSensitive, occurrence: n, rects: _matchRects(items, map, starts[n - 1], needle.length) };
+    }
+    if (starts.length > 1) {
+        return { found: true, ambiguous: true, count: starts.length, caseSensitive: caseSensitive, rects: [], candidates: candidates() };
+    }
+    return { found: true, count: 1, caseSensitive: caseSensitive, occurrence: 1, rects: _matchRects(items, map, starts[0], needle.length) };
 }
 
 function _pdfPageText(tc) {
@@ -1799,8 +1832,11 @@ function registerEndpoints() {
                 let doc = await loadPdfDoc(resolved.path);
                 if (pageNum < 1 || pageNum > doc.numPages) return sendResponseCallback(400, "application/json", JSON.stringify({ error: "page out of range", range: "1.." + doc.numPages }));
                 let tc = await (await doc.getPage(pageNum)).getTextContent();
-                let res = findTextRects(tc.items, data.text);
-                if (!res.found || !res.rects.length) return sendResponseCallback(404, "application/json", JSON.stringify({ error: "Text not found on page " + pageNum + " (use exact, unique text)" }));
+                let res = findTextRects(tc.items, data.text, data.occurrence);
+                if (!res.found) return sendResponseCallback(404, "application/json", JSON.stringify({ error: "Text not found on page " + pageNum + " (use exact, unique text)" }));
+                if (res.ambiguous) return sendResponseCallback(409, "application/json", JSON.stringify({ error: "Text matches " + res.count + " places on page " + pageNum + "; nothing was created. Use longer text that is unique on the page, or pass occurrence (1-based) to pick one of the candidates.", caseSensitive: res.caseSensitive, candidates: res.candidates }));
+                if (res.outOfRange) return sendResponseCallback(400, "application/json", JSON.stringify({ error: "occurrence must be 1.." + res.count + " (text matches " + res.count + " places on page " + pageNum + ")", caseSensitive: res.caseSensitive, candidates: res.candidates }));
+                if (!res.rects.length) return sendResponseCallback(404, "application/json", JSON.stringify({ error: "Text not found on page " + pageNum + " (use exact, unique text)" }));
                 let a = new Zotero.Item("annotation");
                 a.libraryID = resolved.item.libraryID;
                 a.parentID = resolved.id;
@@ -1813,7 +1849,7 @@ function registerEndpoints() {
                 a.annotationPosition = JSON.stringify({ pageIndex: pageNum - 1, rects: res.rects });
                 await a.saveTx();
                 log("Created highlight " + a.key + " on " + resolved.key + " p" + pageNum);
-                sendResponseCallback(201, "application/json", JSON.stringify({ success: true, annotation: { key: a.key, parentItemKey: resolved.key, page: pageNum, color: a.annotationColor, rects: res.rects } }));
+                sendResponseCallback(201, "application/json", JSON.stringify({ success: true, annotation: { key: a.key, parentItemKey: resolved.key, page: pageNum, color: a.annotationColor, rects: res.rects, occurrence: res.occurrence, matches: res.count } }));
             } catch (e) {
                 log("Error creating highlight: " + e);
                 sendResponseCallback(500, "application/json", JSON.stringify({ error: "Internal error", message: e.message }));

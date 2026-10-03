@@ -93,6 +93,19 @@ The system SHALL expose an MCP tool `zotero_create_highlight` for text highlight
 - **WHEN** the specified text is not found on the given page
 - **THEN** it returns an error indicating the text was not found
 
+#### Scenario: Exact-case match preferred
+- **WHEN** the text matches exactly once with the same letter case, and other places only case-insensitively
+- **THEN** it highlights the exact-case match
+
+#### Scenario: Text matches more than one place
+- **WHEN** the text matches more than one place on the page and no `occurrence` is given
+- **THEN** it creates no highlight
+- **AND** returns an error listing each candidate with its occurrence number, surrounding text, and rectangles
+
+#### Scenario: Pick a match by occurrence
+- **WHEN** `zotero_create_highlight` is called with `occurrence` n (1-based, reading order)
+- **THEN** it highlights the n-th match on the page, or returns an error if n is out of range
+
 #### Scenario: All semantic colors supported
 - **WHEN** `zotero_create_highlight` is called with any of: section1, section2, section3, positive, detail, negative, code
 - **THEN** it creates a highlight with the corresponding hex color
